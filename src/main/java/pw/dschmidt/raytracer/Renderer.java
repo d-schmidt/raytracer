@@ -3,7 +3,6 @@ package pw.dschmidt.raytracer;
 import org.apache.commons.math3.geometry.euclidean.threed.Vector3D;
 import org.apache.commons.math3.util.FastMath;
 
-import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.Image;
 import java.awt.image.BufferedImage;
@@ -14,14 +13,13 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-import java.util.stream.IntStream;
 
 import javax.imageio.ImageIO;
 
 
 public class Renderer {
 
-    private final int MAX_RAY_DEPTH = 3;
+    private final int MAX_RAY_DEPTH = 5;
 
     private final int width;
     private final int height;
@@ -29,19 +27,19 @@ public class Renderer {
     private final double fov;
 
     private String output;
-    private int i = 1;
 
 
     /**
      * @param width  of resulting image
      * @param height of resulting image
      * @param fov    in degree (1-360)
-     * @param output file name pattern to write to
+     * @param output file name format string to write result to
      */
     public Renderer(int width, int height, double fov, String output) {
-
+        // super scale for smoother edges
         this.width = width * 2;
         this.height = height * 2;
+
         this.fov = fov;
         this.output = output;
     }
@@ -49,12 +47,12 @@ public class Renderer {
 
     public void render(List<Sphere> spheres) {
 
-        // multi threading und file names yo :(
-        IntStream.range(0, 1)
-                .asDoubleStream()
-                .map(FastMath::toRadians)
-                .mapToObj(rad -> new Vector3D(5 * FastMath.sin(rad), 0, 5 * FastMath.cos(rad) - 5))
-                .forEach(origin -> render(spheres, origin));
+        // render from different angles
+        for (int degree = 0; degree < 360; degree+=90) {
+            double rad = FastMath.toRadians(degree);
+            Vector3D origin = new Vector3D(5 * FastMath.sin(rad), 0, 5 * FastMath.cos(rad) - 5);
+            render(spheres, origin, degree);
+        }
     }
 
 
@@ -66,31 +64,30 @@ public class Renderer {
     }
 
 
-    private void render(List<Sphere> spheres, Vector3D origin) {
-
-        Vector3D[][] image = new Vector3D[this.width][this.height];
+    private void render(List<Sphere> spheres, Vector3D origin, int imageId) {
+        Vector3D[] image = new Vector3D[this.width * this.height];
         double inverseWidth = 1. / this.width;
         double inverseHeight = 1. / this.height;
         double aspectRatio = this.width / (double) this.height;
         double angle = FastMath.tan(FastMath.toRadians(0.5 * this.fov));
 
         List<Future<?>> rows = new ArrayList<>(this.width * this.height);
-        for (int y = 0; y < height; ++y) {
+        for (int y = 0; y < height; y++) {
             final int fy = y;
             rows.add(CompletableFuture.runAsync(() -> {
-                for (int x = 0; x < width; ++x) {
+                for (int x = 0; x < width; x++) {
                     double xx = (2 * ((x + 0.5) * inverseWidth) - 1) * angle * aspectRatio;
                     double yy = (1 - 2 * ((fy + 0.5) * inverseHeight)) * angle;
                     Vector3D rayDirection = new Vector3D(xx, yy, -1).normalize();
                     Vector3D result = trace(origin, rayDirection, spheres, 0);
-                    image[x][fy] = result;
+                    image[fy * width + x] = result;
                 }
             }));
         }
 
         rows.forEach(this::getFuture);
 
-        writeImage(image);
+        writeImage(image, imageId);
     }
 
 
@@ -136,17 +133,17 @@ public class Renderer {
             inside = true;
         }
 
-        if ((hitSphere.getTransparency() > 0 || hitSphere.getReflection() > 0) && depth < MAX_RAY_DEPTH) {
-            double facingratio = -rayDirection.dotProduct(nhit);
-            // change the mix value to tweak the effect
-            double fresneleffect = mix(FastMath.pow(1 - facingratio, 3), 1, 0.1);
+        if ((hitSphere.getTransparency() > 0 || hitSphere.getReflection() > 0)
+                && depth < MAX_RAY_DEPTH) {
+            double fresnelEffect = getFresnelEffect(rayDirection, nhit);
             // compute reflection direction (not need to normalize because all vectors
             // are already normalized)
-            Vector3D refldir = rayDirection.subtract(
-                    nhit.scalarMultiply(2).scalarMultiply(rayDirection.dotProduct(nhit)));
-            refldir = refldir.normalize();
+            Vector3D reflectionDirection = rayDirection.subtract(
+                    nhit.scalarMultiply(2)
+                            .scalarMultiply(rayDirection.dotProduct(nhit)));
+            reflectionDirection = reflectionDirection.normalize();
             Vector3D reflection = trace(phit.add(nhit.scalarMultiply(bias)),
-                                        refldir,
+                                        reflectionDirection,
                                         spheres,
                                         depth + 1);
             Vector3D refraction = Vector3D.ZERO;
@@ -165,8 +162,8 @@ public class Renderer {
                                    depth + 1);
             }
             // the result is a mix of reflection and refraction (if the sphere is transparent)
-            surfaceColor = product(reflection.scalarMultiply(fresneleffect)
-                                           .add(refraction.scalarMultiply(1 - fresneleffect)
+            surfaceColor = product(reflection.scalarMultiply(fresnelEffect)
+                                           .add(refraction.scalarMultiply(1 - fresnelEffect)
                                                         .scalarMultiply(hitSphere.getTransparency())),
                                    hitSphere.getSurfaceColor());
         } else {
@@ -201,11 +198,10 @@ public class Renderer {
     }
 
 
-    /**
-     * https://en.wikipedia.org/wiki/Hadamard_product_(matrices)
-     */
-    private Vector3D product(Vector3D a, Vector3D b) {
-        return new Vector3D(a.getX() * b.getX(), a.getY() * b.getY(), a.getZ() * b.getZ());
+    private double getFresnelEffect(Vector3D rayDirection, Vector3D nhit) {
+        double facingRatio = -rayDirection.dotProduct(nhit);
+        // change the mix value to tweak the effect
+        return mix(FastMath.pow(1 - facingRatio, 3), 1, 0.1);
     }
 
 
@@ -214,35 +210,59 @@ public class Renderer {
     }
 
 
-    private void writeImage(Vector3D[][] image) {
-        BufferedImage bi = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+    /**
+     * https://en.wikipedia.org/wiki/Hadamard_product_(matrices)
+     */
+    private Vector3D product(Vector3D a, Vector3D b) {
+        return new Vector3D(a.getX() * b.getX(), a.getY() * b.getY(), a.getZ() * b.getZ());
+    }
+
+
+    private void writeImage(Vector3D[] image, int imageId) {
+        BufferedImage superScaleImage = new BufferedImage(width,
+                                                          height,
+                                                          BufferedImage.TYPE_INT_RGB);
 
         for (int x = 0; x < width; x++) {
             for (int y = 0; y < height; y++) {
-                Vector3D color = image[x][y];
-                bi.setRGB(x, y,
-                          new Color((float) FastMath.max(0, FastMath.min(1, color.getX())),
-                                    (float) FastMath.max(0, FastMath.min(1, color.getY())),
-                                    (float) FastMath.max(0,
-                                                         FastMath.min(1, color.getZ()))).getRGB());
+                Vector3D color = image[y * width + x];
+                superScaleImage.setRGB(x, y, getVectorAsRGB(color));
             }
         }
-        try {
 
+        try {
             BufferedImage outputImage = new BufferedImage(width / 2,
                                                           height / 2,
                                                           BufferedImage.TYPE_INT_RGB);
 
-            Image smooth = bi.getScaledInstance(width / 2, height / 2, Image.SCALE_SMOOTH);
-            // scales the input image to the output image
-            Graphics2D g2d = outputImage.createGraphics();
-            g2d.drawImage(smooth, 0, 0, null);
-            g2d.dispose();
+            Image targetSizeImage = superScaleImage.getScaledInstance(width / 2,
+                                                                      height / 2,
+                                                                      Image.SCALE_SMOOTH);
 
-            ImageIO.write(outputImage, "png", new File(String.format(output, i)));
-            i++;
+            Graphics2D outputGraphics = outputImage.createGraphics();
+            outputGraphics.drawImage(targetSizeImage, 0, 0, null);
+            outputGraphics.dispose();
+
+            ImageIO.write(outputImage, "png", new File(String.format(output, imageId)));
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+
+    private int getVectorAsRGB(Vector3D color) {
+        return (getColorAsInt(color.getX()) << 16) |
+                (getColorAsInt(color.getY()) << 8) |
+                getColorAsInt(color.getZ());
+    }
+
+
+    /**
+     * @param color around 0.0 .. 1.0
+     * @return color 0 - 255
+     */
+    private int getColorAsInt(double color) {
+        double minMax = FastMath.max(0, FastMath.min(1, color));
+        return ((int) (minMax * 255 + 0.5) & 0xFF);
     }
 }
