@@ -49,7 +49,7 @@ public class Renderer {
 
     public void render(List<Sphere> spheres) {
 
-        // multi threading und file names jo :(
+        // multi threading und file names yo :(
         IntStream.range(0, 1)
                 .asDoubleStream()
                 .map(FastMath::toRadians)
